@@ -1,173 +1,305 @@
+# -*- coding: utf-8 -*-
 import logging
 import os
+import json
+from datetime import datetime, date, time
+from zoneinfo import ZoneInfo
+import html
+
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from splitwise import Splitwise
-# from splitwise.group import Group # Descomente se precisar dos tipos
-# from splitwise.user import User
-# from splitwise.expense import Expense
 
-# Carrega variáveis do arquivo .env para o ambiente (se existir)
-# É seguro chamar mesmo antes do arquivo .env ser criado
+# Imports do Telegram
+from telegram import Update, constants
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ExtBot, JobQueue
+
+# --- Configurações Iniciais ---
 load_dotenv()
-
-# Configuração básica de logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- Ler Credenciais do Ambiente ---
+# --- Leitura de Credenciais e Constantes ---
 TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
-SPLITWISE_CONSUMER_KEY = os.environ.get('SPLITWISE_CONSUMER_KEY')
-SPLITWISE_CONSUMER_SECRET = os.environ.get('SPLITWISE_CONSUMER_SECRET')
+STATE_FILE = "bot_state.json"
+TELEGRAM_GROUP_ID_STR = os.environ.get('TELEGRAM_GROUP_ID')
+ADMIN_USER_ID_STR = os.environ.get('ADMIN_USER_ID')
+SCHEDULER_TIMEZONE = os.environ.get('SCHEDULER_TIMEZONE', 'America/Fortaleza')
+
+# --- ORDEM DE PAGAMENTO ---
+PAYMENT_ORDER = ["Lucas", "Thiago", "Victor", "Alice", "Aline", "Matheus"]
+MESES_PT_BR = {1: "Janeiro", 2: "Fevereiro", 3: "Março", 4: "Abril", 5: "Maio", 6: "Junho", 7: "Julho", 8: "Agosto", 9: "Setembro", 10: "Outubro", 11: "Novembro", 12: "Dezembro"}
 
 # --- Verificação Crítica das Credenciais ---
-# Sai imediatamente se alguma variável essencial não estiver definida
-if not TOKEN:
-    logger.critical("ERRO FATAL: TELEGRAM_BOT_TOKEN não encontrado nas variáveis de ambiente!")
-    exit("ERRO FATAL: TELEGRAM_BOT_TOKEN não configurado.")
-if not SPLITWISE_CONSUMER_KEY:
-    logger.critical("ERRO FATAL: SPLITWISE_CONSUMER_KEY não encontrado nas variáveis de ambiente!")
-    exit("ERRO FATAL: SPLITWISE_CONSUMER_KEY não configurado.")
-if not SPLITWISE_CONSUMER_SECRET:
-    logger.critical("ERRO FATAL: SPLITWISE_CONSUMER_SECRET não encontrado nas variáveis de ambiente!")
-    exit("ERRO FATAL: SPLITWISE_CONSUMER_SECRET não configurado.")
+if not TOKEN: logger.critical("ERRO FATAL: TELEGRAM_BOT_TOKEN não configurado."); exit()
 
-# --- Constantes ---
-# Usaremos uma URL genérica aqui, mas lembre-se que o fluxo de callback precisa ser tratado
-SPLITWISE_CALLBACK_URL = os.environ.get('SPLITWISE_CALLBACK_URL', 'http://localhost:8080/callback')
+# --- Processamento e Validação de IDs (Sintaxe Verificada) ---
+telegram_group_id_int = None
+if TELEGRAM_GROUP_ID_STR:
+    try: # Bloco if/try/except CORRIGIDO E VERIFICADO
+        telegram_group_id_int = int(TELEGRAM_GROUP_ID_STR)
+    except ValueError:
+        logger.error(f"ERRO: TELEGRAM_GROUP_ID ('{TELEGRAM_GROUP_ID_STR}') inválido!")
+else:
+    logger.warning("AVISO: TELEGRAM_GROUP_ID não definido no .env.")
 
-# --- Armazenamento Temporário (Substituir por DB em produção) ---
-# ATENÇÃO: Isso ainda é em memória e será perdido ao reiniciar o bot.
-user_data = {}
+admin_user_id_int = None
+if ADMIN_USER_ID_STR:
+    try: # Bloco if/try/except CORRIGIDO E VERIFICADO
+        admin_user_id_int = int(ADMIN_USER_ID_STR)
+    except ValueError:
+        logger.error(f"AVISO: ADMIN_USER_ID ('{ADMIN_USER_ID_STR}') inválido!")
+else:
+    logger.warning("AVISO: ADMIN_USER_ID não definido.")
 
-# --- Funções Handler de Comandos ---
+# Carregar Timezone
+try:
+    tz = ZoneInfo(SCHEDULER_TIMEZONE)
+except Exception as tz_error:
+    logger.error(f"Erro timezone '{SCHEDULER_TIMEZONE}': {tz_error}. Usando UTC.")
+    tz = ZoneInfo("UTC")
 
+# --- Funções de Persistência ---
+def load_bot_state():
+    default_state = {"last_payer_index": -1, "current_payer_index": 0, "current_payer_name": PAYMENT_ORDER[0], "current_cycle_paid": False}
+    try:
+        with open(STATE_FILE, 'r', encoding='utf-8') as f: data = json.load(f)
+        state = default_state.copy(); state.update(data)
+        state['last_payer_index'] = int(state.get('last_payer_index', -1))
+        state['current_payer_index'] = (state['last_payer_index'] + 1) % len(PAYMENT_ORDER)
+        state['current_payer_name'] = PAYMENT_ORDER[state['current_payer_index']]
+        state['current_cycle_paid'] = bool(state.get('current_cycle_paid', False))
+        if not (-1 <= state['last_payer_index'] < len(PAYMENT_ORDER)): state['last_payer_index'] = -1
+        if not (0 <= state['current_payer_index'] < len(PAYMENT_ORDER)): state['current_payer_index'] = (state['last_payer_index'] + 1) % len(PAYMENT_ORDER)
+        state['current_payer_name'] = PAYMENT_ORDER[state['current_payer_index']]
+        logger.info(f"Estado carregado: {state}")
+        return state
+    except FileNotFoundError: logger.warning(f"'{STATE_FILE}' não encontrado."); return default_state
+    except Exception as e: logger.error(f"Erro carregar estado '{STATE_FILE}': {e}"); return default_state
+
+def save_bot_state(state):
+    if not isinstance(state.get('last_payer_index'), int) or not isinstance(state.get('current_payer_index'), int) or not isinstance(state.get('current_payer_name'), str) or not isinstance(state.get('current_cycle_paid'), bool):
+        logger.error(f"Tentativa salvar estado inválido: {state}"); return
+    try:
+        with open(STATE_FILE, 'w', encoding='utf-8') as f: json.dump(state, f, indent=4)
+        logger.debug(f"Estado salvo: {state}")
+    except Exception as e: logger.error(f"Erro salvar estado '{STATE_FILE}': {e}")
+
+# --- Carrega o estado ao iniciar ---
+bot_state = load_bot_state()
+
+# --- Funções Auxiliares ---
+def escape_html(text: str) -> str: return html.escape(str(text), quote=False)
+
+# --- Funções Handler de Comandos Telegram ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Envia mensagem de boas-vindas."""
-    user = update.effective_user
-    await update.message.reply_html(
-        rf"Olá {user.mention_html()}! Pronto para gerenciar os pagamentos."
-    )
+    user = update.effective_user;
+    if not user or not admin_user_id_int or user.id != admin_user_id_int: logger.warning(f"User {user.id if user else '??'} tentou /start."); return
+    await update.message.reply_html(rf"Olá Admin {user.mention_html()}! Bot pronto. Use /help ou /comandos.")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Mostra a lista de comandos."""
-    help_text = (
-        "Comandos disponíveis:\n"
-        "/start - Inicia o bot\n"
+    user = update.effective_user;
+    if not user or not admin_user_id_int or user.id != admin_user_id_int: logger.warning(f"User {user.id if user else '??'} tentou /help."); return
+    admin_help_text = (
+        "--- Comandos de Admin ---\n"
+        "/start - Verifica o bot\n"
         "/help - Mostra esta ajuda\n"
-        "/connect_splitwise - Conecta sua conta Splitwise\n"
-        "/authorize_code <code> - Finaliza a conexão (use o código da URL)\n"
-        "/meus_grupos - Lista seus grupos no Splitwise (requer conexão)"
-        # Adicionar mais comandos aqui depois
+        "/pago - (Use no Privado) Marca pagto recebido\n"
+        "/reenviar - (Use no Privado) Reenvia lembrete atual\n\n" # RENOMEADO AQUI
+        "--- Comandos Públicos (/comandos) ---\n"
+        "/lista - Ordem de pagamento\n"
+        "/status - Pagador atual e status\n"
+        "/nome - Ex: /lucas - Próximo pagamento"
     )
-    await update.message.reply_text(help_text)
+    try: await update.message.reply_text(f"Ajuda (Admin):\n{admin_help_text}")
+    except Exception as e: logger.error(f"Erro enviar /help admin {user.id}: {e}")
 
-async def connect_splitwise(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Inicia o processo de autorização OAuth 2.0 com Splitwise."""
-    user_id = update.effective_user.id
-    # Usa as chaves lidas do ambiente
-    s_obj = Splitwise(SPLITWISE_CONSUMER_KEY, SPLITWISE_CONSUMER_SECRET)
+async def lista_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None: # RENOMEADO
+    message = "📅 Ordem de Pagamento:\n"
+    for i, name in enumerate(PAYMENT_ORDER): message += f"\n{i+1}. {escape_html(name)}"
+    try: await update.message.reply_html(message)
+    except Exception as e: logger.error(f"Erro enviar /lista: {e}")
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    global bot_state
+    current_name = bot_state.get('current_payer_name', 'Indefinido')
+    current_index = bot_state.get('current_payer_index', -1)
+    is_paid = bot_state.get('current_cycle_paid', False)
+    status_text = "✅ Pago" if is_paid else "⏳ Pendente"
+    month_now = datetime.now(tz).month; year_now = datetime.now(tz).year
+    month_name_pt = MESES_PT_BR.get(month_now, f"Mês {month_now}")
+    message = (f"📊 Status Pagamento Atual ({escape_html(month_name_pt)}/{year_now}):\n\n"
+               f"👤 Vez de: <b>{escape_html(current_name)}</b> (Posição {current_index + 1})\n\n"
+               f"💰 Status: {status_text}")
+    try: await update.message.reply_html(message)
+    except Exception as e: logger.error(f"Erro enviar /status: {e}")
+
+async def handle_name_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    global bot_state
+    if not update.message or not update.message.text or not update.message.text.startswith('/'): return
+    command_name = update.message.text[1:].split('@')[0]; search_name_lower = command_name.lower()
+    target_index = -1; target_name_exact = None
+    for i, name in enumerate(PAYMENT_ORDER):
+        if search_name_lower == name.lower(): target_index = i; target_name_exact = name; break
+    if target_index == -1: logger.debug(f"Comando /{command_name} não é nome."); return
     try:
-        auth_url, state = s_obj.getOAuth2AuthorizeURL(SPLITWISE_CALLBACK_URL)
-        # Armazena o state para validação futura (associado ao user_id)
-        user_data[user_id] = {'oauth_state': state}
-        logger.info(f"Gerada URL de autorização para user {user_id}. State: {state[:5]}...") # Log reduzido
-        message = (
-            "Para conectar ao Splitwise:\n\n"
-            f"1. Clique no link e autorize o app:\n{auth_url}\n\n"
-            "2. Após autorizar, copie o parâmetro 'code' da URL.\n"
-            "3. Envie para mim: `/authorize_code SEU_CODIGO_AQUI`"
-        )
-        await update.message.reply_text(message, disable_web_page_preview=True)
-    except Exception as e:
-        logger.exception(f"Erro ao gerar URL de autorização Splitwise para user {user_id}:")
-        await update.message.reply_text("Erro ao iniciar conexão com Splitwise. Tente novamente.")
+        current_index = bot_state.get('current_payer_index', 0)
+        if target_index >= current_index: steps = target_index - current_index
+        else: steps = len(PAYMENT_ORDER) - current_index + target_index
+        today = date.today(); target_month_offset = steps
+        target_year = today.year + (today.month + target_month_offset - 1) // 12
+        target_month = (today.month + target_month_offset - 1) % 12 + 1
+        month_name_pt = MESES_PT_BR.get(target_month, f"Mês {target_month}")
+        if steps == 1: prazo_str = "(daqui a 1 mês)"
+        else: prazo_str = f"(daqui a {steps} meses)"
+        if steps == 0: prazo_str = "(este mês!)"
+        message = (f"🗓️ O próximo pagamento de <b>{escape_html(target_name_exact)}</b> será dia 1º de <b>{escape_html(month_name_pt)} de {target_year}</b>\n"
+                   f"{prazo_str}")
+        await update.message.reply_html(message)
+    except Exception as e: logger.error(f"Erro no comando /{command_name}: {e}"); await update.message.reply_text("Erro ao calcular.")
 
-async def authorize_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Recebe o código OAuth e tenta obter o access token."""
-    user_id = update.effective_user.id
-    code = ' '.join(context.args)
-    if not code:
-        await update.message.reply_text("Uso: /authorize_code <código_da_url>")
-        return
+async def pago_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    global bot_state
+    user = update.effective_user; chat = update.effective_chat
+    if not chat or chat.type != 'private': logger.debug("Comando /pago ignorado (não privado)."); return
+    if not user or not admin_user_id_int or user.id != admin_user_id_int: logger.warning(f"User {user.id if user else '??'} tentou /pago."); await update.message.reply_text("⛔ Apenas o admin."); return
+    current_name = bot_state.get('current_payer_name', 'N/A')
+    if bot_state.get('current_cycle_paid', False): await update.message.reply_text(f"✅ Pagamento de <b>{escape_html(current_name)}</b> já registrado.", parse_mode=constants.ParseMode.HTML); return
+    bot_state['current_cycle_paid'] = True
+    save_bot_state(bot_state)
+    logger.info(f"Admin {user.id} marcou pagamento de {current_name} como recebido.")
+    await update.message.reply_text(f"✅ Pagamento de <b>{escape_html(current_name)}</b> registrado!", parse_mode=constants.ParseMode.HTML)
+    if telegram_group_id_int:
+        try:
+            group_message = f"🎉 Pagamento de <b>{escape_html(current_name)}</b> confirmado pelo admin!\n\nObrigado!"
+            await context.bot.send_message(chat_id=telegram_group_id_int, text=group_message, parse_mode=constants.ParseMode.HTML)
+            logger.info(f"Anúncio /pago enviado grupo {telegram_group_id_int}")
+        except Exception as group_send_err:
+            logger.error(f"Falha anunciar /pago grupo {telegram_group_id_int}: {group_send_err}")
+            await update.message.reply_text(f"<i>(AVISO: não anunciei no grupo.)</i>", parse_mode=constants.ParseMode.HTML)
+    else: logger.warning("Comando /pago: Anúncio não enviado (ID grupo ausente)."); await update.message.reply_text("<i>(AVISO: Anúncio não enviado - ID grupo não config.)</i>", parse_mode=constants.ParseMode.HTML)
 
-    # Verificar o state seria ideal aqui para segurança, comparando com user_data[user_id]['oauth_state']
+async def comandos_publicos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Mostra os comandos disponíveis para todos os usuários."""
+    public_help = ("Comandos disponíveis:\n\n"
+                   "/lista - Mostra a ordem de pagamento\n\n"
+                   "/status - Mostra pagador atual e status\n\n"
+                   "/nome - Ex: /lucas - Mostra quando será o próximo pagamento dessa pessoa") # Clarificado
+    try: await update.message.reply_text(public_help)
+    except Exception as e: logger.error(f"Erro enviar /comandos: {e}")
 
-    s_obj = Splitwise(SPLITWISE_CONSUMER_KEY, SPLITWISE_CONSUMER_SECRET)
-    try:
-        # Troca o código pelo token de acesso
-        access_token_data = s_obj.getOAuth2AccessToken(code, SPLITWISE_CALLBACK_URL)
-        access_token = access_token_data['access_token']
-        logger.info(f"Access Token obtido com sucesso para user {user_id}")
+# Comando /reenviar (Admin, Privado) - RENOMEADO
+async def reenviar_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None: # RENOMEADO
+    """Reenvia manualmente o lembrete do mês atual para o grupo (Admin, Privado)."""
+    global bot_state
+    user = update.effective_user; chat = update.effective_chat
+    if not chat or chat.type != 'private': logger.debug("Comando /reenviar ignorado (não privado)."); return
+    if not user or not admin_user_id_int or user.id != admin_user_id_int: logger.warning(f"User {user.id if user else '??'} tentou /reenviar."); await update.message.reply_text("⛔ Apenas o admin."); return
 
-        # Guarda o token de forma segura (aqui, no dicionário de teste)
-        if user_id not in user_data: user_data[user_id] = {}
-        user_data[user_id]['splitwise_token'] = access_token
-        if 'oauth_state' in user_data[user_id]:
-             del user_data[user_id]['oauth_state'] # Limpa o state
+    payer_this_month_name = bot_state.get('current_payer_name', None)
+    if not payer_this_month_name: logger.error("Comando /reenviar: Estado 'current_payer_name' não encontrado."); await update.message.reply_text("❌ Erro: Pagador atual não definido."); return
 
-        await update.message.reply_text("✅ Conectado ao Splitwise com sucesso! Use /meus_grupos.")
+    # Monta a mensagem (mesma lógica do job agendado)
+    run_time = datetime.now(tz)
+    month_number = run_time.month; month_name_pt = MESES_PT_BR.get(month_number, f"Mês {month_number}")
+    year = run_time.year; payer_escaped = escape_html(payer_this_month_name); admin_username_escaped = escape_html("@lucas_gdn")
+    message = (f"🚨 <b>Lembrete Pagamento Spotify - {escape_html(month_name_pt)}/{year}</b> 🚨\n\n\n"
+               f"👤 Este mês, a vez de pagar é sua: <b>{payer_escaped}</b>\n\n\n"
+               f"(Faça um pix de R$ 34,90 para a chave: lucas.stos@gmail.com (Picpay) e peça para o {admin_username_escaped} confirmar no privado!)")
 
-    except Exception as e:
-        logger.exception(f"Erro ao obter Access Token do Splitwise para user {user_id}:")
-        await update.message.reply_text(f"❌ Erro ao autorizar com o código. Verifique-o ou use /connect_splitwise novamente.")
+    # Envia para o grupo
+    if telegram_group_id_int:
+        try:
+            await context.bot.send_message(chat_id=telegram_group_id_int, text=message, parse_mode=constants.ParseMode.HTML)
+            logger.info(f"Admin {user.id} reenviou lembrete para grupo {telegram_group_id_int}")
+            await update.message.reply_text(f"✅ Lembrete para <b>{escape_html(payer_this_month_name)}</b> reenviado para o grupo!", parse_mode=constants.ParseMode.HTML)
+        except Exception as send_error:
+            logger.error(f"Falha ao reenviar lembrete para grupo {telegram_group_id_int}: {send_error}")
+            await update.message.reply_text(f"❌ Falha ao reenviar lembrete. Erro: {send_error}")
+    else: logger.warning("Comando /reenviar: Mensagem não enviada (Grupo ID ausente)."); await update.message.reply_text("❌ Não posso reenviar: ID do grupo não configurado.")
 
 
-async def get_my_groups(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Busca e lista os grupos do usuário no Splitwise."""
-    user_id = update.effective_user.id
-    access_token = user_data.get(user_id, {}).get('splitwise_token')
+# --- Função Agendada ---
+async def check_spotify_payment(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Função agendada para enviar lembrete e avançar a rotação."""
+    global bot_state
+    bot: ExtBot = context.bot; job = context.job; run_time = datetime.now(tz)
+    logger.info(f"Executando job '{job.name if job else 'N/A'}' em {run_time.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    check_user_id = admin_user_id_int if admin_user_id_int else (list(bot_state.keys())[0] if bot_state else None)
+    if not check_user_id: logger.warning("Job: Nenhum usuário admin encontrado para estado."); return
 
-    if not access_token:
-        await update.message.reply_text("⚠️ Você precisa conectar sua conta Splitwise primeiro usando /connect_splitwise.")
-        return
+    # Calcula pagador e define estado atual
+    last_payer_index = bot_state.get('last_payer_index', -1)
+    current_payer_index = (last_payer_index + 1) % len(PAYMENT_ORDER)
+    payer_this_month_name = PAYMENT_ORDER[current_payer_index]
+    logger.info(f"Job: Definindo ciclo atual para: {payer_this_month_name} (índice {current_payer_index})")
+    bot_state['current_payer_index'] = current_payer_index
+    bot_state['current_payer_name'] = payer_this_month_name
+    bot_state['current_cycle_paid'] = False # Reseta status
 
-    s_obj = Splitwise(SPLITWISE_CONSUMER_KEY, SPLITWISE_CONSUMER_SECRET)
-    # Configura o objeto Splitwise com o token de acesso do usuário
-    s_obj.setOAuth2AccessToken({'access_token': access_token})
+    # Prepara mensagem
+    month_number = run_time.month; month_name_pt = MESES_PT_BR.get(month_number, f"Mês {month_number}")
+    year = run_time.year; payer_escaped = escape_html(payer_this_month_name); admin_username_escaped = escape_html("@lucas_gdn")
+    message = (f"🚨 <b>Lembrete Pagamento Spotify - {escape_html(month_name_pt)}/{year}</b> 🚨\n\n\n"
+               f"👤 Este mês, a vez de pagar é sua: <b>{payer_escaped}</b>\n\n\n"
+               f"(Faça um pix de R$ 34,90 para a chave: lucas.stos@gmail.com (Picpay) e peça para o {admin_username_escaped} confirmar no privado!)")
 
-    try:
-        logger.info(f"Buscando grupos do Splitwise para user {user_id}")
-        groups = s_obj.getGroups()
+    # Envia mensagem e atualiza índice para próximo ciclo
+    message_sent_successfully = False
+    if telegram_group_id_int:
+        try:
+            await bot.send_message(chat_id=telegram_group_id_int, text=message, parse_mode=constants.ParseMode.HTML)
+            logger.info(f"Mensagem enviada grupo {telegram_group_id_int} (HTML)")
+            message_sent_successfully = True
+        except Exception as send_error:
+            logger.error(f"Falha envio grupo {telegram_group_id_int}: {send_error}")
+            # --- Bloco de Notificação Admin CORRIGIDO E VERIFICADO ---
+            if admin_user_id_int:
+                try: # try indentado
+                    await bot.send_message(chat_id=admin_user_id_int, text=f"⚠️ Falha ao enviar lembrete HTML grupo {telegram_group_id_int}. Erro: {send_error}")
+                except Exception as notify_error: # except indentado
+                    logger.error(f"Falha ao notificar admin {admin_user_id_int}: {notify_error}")
+            # --- Fim da Correção ---
+    else: logger.warning("Job: TELEGRAM_GROUP_ID inválido.")
 
-        if groups:
-            message = "Seus grupos no Splitwise:\n"
-            for group in groups:
-                message += f"  - {group.getName()} (ID: {group.getId()})\n"
-        else:
-            message = "Você não parece estar em nenhum grupo no Splitwise."
-
-        await update.message.reply_text(message)
-
-    except Exception as e:
-        logger.exception(f"Erro ao buscar grupos do Splitwise para user {user_id}:")
-        # Idealmente, verificar tipo de erro (ex: token expirado?)
-        await update.message.reply_text("❌ Erro ao buscar seus grupos no Splitwise. Tente mais tarde ou reconecte.")
+    # Atualiza o índice do último pagador e salva o estado completo
+    bot_state['last_payer_index'] = current_payer_index
+    save_bot_state(bot_state)
 
 
 # --- Função Principal ---
 def main() -> None:
-    """Inicia o bot e configura os handlers."""
-    logger.info("Iniciando o bot...")
+    """Inicia o bot, handlers e agendador via JobQueue."""
+    logger.info(f"Iniciando o bot (vFinal v4)... Estado inicial: {bot_state}")
+    try:
+        application = Application.builder().token(TOKEN).build()
+        job_queue: JobQueue = application.job_queue
+    except Exception as app_error: logger.critical(f"ERRO FATAL APP TELEGRAM: {app_error}"); exit()
 
-    # Cria a Application e passa o token lido do ambiente
-    application = Application.builder().token(TOKEN).build()
-
-    # Registra os handlers de comando
+    # --- Registra Handlers ---
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("connect_splitwise", connect_splitwise))
-    application.add_handler(CommandHandler("authorize_code", authorize_code))
-    application.add_handler(CommandHandler("meus_grupos", get_my_groups))
+    application.add_handler(CommandHandler("pago", pago_command))
+    application.add_handler(CommandHandler("lista", lista_command)) # Renomeado
+    application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(CommandHandler("comandos", comandos_publicos))
+    application.add_handler(CommandHandler("reenviar", reenviar_command)) # RENOMEADO
 
-    # Adicionar handlers para mensagens desconhecidas ou outros tipos, se necessário
+    # Handler para /<Nome>
+    application.add_handler(MessageHandler(filters.COMMAND, handle_name_command))
 
-    logger.info("Bot pronto e aguardando comandos.")
-    # Inicia o bot (modo polling)
+    # --- Agendamento via JobQueue ---
+    try:
+        # --- TRIGGER DE TESTE (Comente para produção) ---
+        # job_queue.run_repeating(callback=check_spotify_payment, interval=30, first=10, name='Lembrete Teste Spotify')
+        # logger.info("Usando JobQueue.run_repeating (a cada 30 segundos)")
+
+        # --- Trigger MENSAL REAL (Descomente para produção) ---
+        run_time_prod = time(hour=9, minute=0, second=0, tzinfo=tz) # 9:00 no timezone definido
+        job_queue.run_monthly(callback=check_spotify_payment, when=run_time_prod, day=1, name='Lembrete Mensal Spotify')
+        logger.info(f"Usando JobQueue.run_monthly (Dia 1, 09:00 {SCHEDULER_TIMEZONE})")
+
+    except Exception: logger.exception("Falha ao agendar o job:")
+
+    logger.info("Bot pronto.")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

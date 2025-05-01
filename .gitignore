@@ -173,3 +173,7 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 expressions.txt
+user_tokens.json
+bot_state.json
+*.pyc
+
