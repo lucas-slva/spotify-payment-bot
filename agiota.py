@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 # --- Leitura de Credenciais e Constantes ---
 TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
-STATE_FILE = "bot_state.json"
+STATE_FILE = "/data/bot_state.json"
 TELEGRAM_GROUP_ID_STR = os.environ.get('TELEGRAM_GROUP_ID')
 ADMIN_USER_ID_STR = os.environ.get('ADMIN_USER_ID')
 SCHEDULER_TIMEZONE = os.environ.get('SCHEDULER_TIMEZONE', 'America/Fortaleza')
