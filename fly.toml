@@ -1,30 +1,30 @@
 # fly.toml app configuration file generated for spotify-payment-bott on 2025-05-01T16:16:05-03:00
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
-# --- VERS√O CORRIGIDA PARA BOT PYTHON (N√O WEB) ---
+# --- VERS√ÉO CORRIGIDA PARA BOT PYTHON (N√ÉO WEB) ---
 
 app = 'spotify-payment-bott' # Mantenha o nome do seu app
 primary_region = 'gru'
 
-# SeÁ„o [build] geralmente pode ser mantida ou omitida se o buildpack detectar Python corretamente
+# Se√ß√£o [build] geralmente pode ser mantida ou omitida se o buildpack detectar Python corretamente
 [build]
   builder = 'paketobuildpacks/builder:base'
 
-# REMOVIDA a seÁ„o [env] que definia PORT=8080 (n„o precisamos)
+# REMOVIDA a se√ß√£o [env] que definia PORT=8080 (n√£o precisamos)
 
-# REMOVIDA toda a seÁ„o [http_service]
+# REMOVIDA toda a se√ß√£o [http_service]
 
-# ADICIONADA/CORRIGIDA a seÁ„o [processes] para definir o comando de start
+# ADICIONADA/CORRIGIDA a se√ß√£o [processes] para definir o comando de start
 [processes]
-  # 'app' È o nome padr„o que o Fly costuma procurar para iniciar.
-  # Use python3 se 'python' n„o for o alias correto no ambiente do buildpack.
-  # Certifique-se que 'agiota.py' È o nome correto do seu arquivo principal.
+  # 'app' √© o nome padr√£o que o Fly costuma procurar para iniciar.
+  # Use python3 se 'python' n√£o for o alias correto no ambiente do buildpack.
+  # Certifique-se que 'agiota.py' √© o nome correto do seu arquivo principal.
   app = "python agiota.py"
 
-# Mantida a configuraÁ„o da VM
+# Mantida a configura√ß√£o da VM
 [[vm]]
   size = 'shared-cpu-1x'
 
-# Mantida a configuraÁ„o do volume persistente
+# Mantida a configura√ß√£o do volume persistente
 [mounts]
 source="bot_data"
 destination="/data"
