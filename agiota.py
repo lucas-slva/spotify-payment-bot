@@ -213,10 +213,15 @@ async def check_spotify_payment(context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.info(f"Mensagem enviada grupo {telegram_group_id_int} (HTML)")
             message_sent_successfully = True
             bot_state['last_payer_index'] = current_payer_index # Só atualiza se o envio principal foi OK
+
         except Exception as send_error:
             logger.error(f"Falha envio grupo {telegram_group_id_int}: {send_error}")
-            if admin_user_id_int: try: await bot.send_message(chat_id=admin_user_id_int, text=f"⚠️ Falha ao enviar lembrete HTML grupo {telegram_group_id_int}. Erro: {send_error}") except Exception as notify_error: logger.error(f"Falha ao notificar admin {admin_user_id_int}: {notify_error}")
-    else: logger.warning("Job: TELEGRAM_GROUP_ID inválido.")
+            if admin_user_id_int:
+                try:  # try em nova linha e indentado
+                    await bot.send_message(chat_id=admin_user_id_int, text=f"⚠️ Falha ao enviar lembrete HTML grupo {telegram_group_id_int}. Erro: {send_error}")
+                except Exception as notify_error: # except indentado
+                    logger.error(f"Falha ao notificar admin {admin_user_id_int}: {notify_error}")
+            else: logger.warning("Job: TELEGRAM_GROUP_ID inválido.")
     save_bot_state(bot_state) # Salva o estado (current_cycle_paid resetado, e last_payer_index se msg foi enviada)
 
 
